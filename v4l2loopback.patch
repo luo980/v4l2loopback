@@ -1,0 +1,136 @@
+diff --git a/v4l2loopback.c b/v4l2loopback.c
+index 483b5ad..78826e8 100644
+--- a/v4l2loopback.c
++++ b/v4l2loopback.c
+@@ -30,6 +30,7 @@
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-event.h>
++#include <linux/ktime.h>
+ 
+ #include <linux/miscdevice.h>
+ #include "v4l2loopback.h"
+@@ -2461,7 +2462,12 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
+ {
+ 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
+ 	struct v4l2_buffer *b;
++	ktime_t now;
++	u64 now_us;
+ 	int index, result;
++	const size_t META_SIZE = 16; // 8B sec + 8B usec
++	bool has_meta = false;
++	u64 user_sec = 0, user_usec = 0;
+ 
+ 	dprintkrw("write() %zu bytes\n", count);
+ 	result = start_fileio(file, file->private_data,
+@@ -2469,20 +2475,93 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
+ 	if (result < 0)
+ 		return result;
+ 
+-	if (count > dev->buffer_size)
+-		count = dev->buffer_size;
++	//if (count > dev->buffer_size)
++		//count = dev->buffer_size;
+ 	index = v4l2l_mod64(dev->write_position, dev->used_buffer_count);
+ 	b = &dev->buffers[index].buffer;
++	
++	// 判断是否包含 metadata
++	if (count == dev->buffer_size + META_SIZE) {
++		pr_info("v4l2loopback write contains metadata\n");
++		has_meta = true;
++		char meta_buf[META_SIZE];
++
++		// 从用户空间读取最后 16 字节
++		if (copy_from_user(meta_buf, buf + dev->buffer_size, META_SIZE)) {
++			printk(KERN_ERR "v4l2-loopback: failed to read metadata\n");
++			return -EFAULT;
++		}
+ 
+-	if (copy_from_user((void *)(dev->image + b->m.offset), (void *)buf,
+-			   count)) {
+-		printk(KERN_ERR
+-		       "v4l2-loopback write() failed copy_from_user()\n");
+-		return -EFAULT;
++		// 解析大端序的 sec 和 usec
++		user_sec  = be64_to_cpu(*((__be64 *)&meta_buf[0]));
++		user_usec = be64_to_cpu(*((__be64 *)&meta_buf[8]));
++
++		uint64_t timestamp_us = user_sec * 1000000 + user_usec;
++
++pr_info( "LOOPBACK WRITE: Applied side-data timestamp = %llu us (sec: %llu, usec: %llu)\n",
++       timestamp_us, user_sec, user_usec);
++		
++		
++		u64 t_start = ktime_get_ns();
++		u64 t_start_us = t_start/1000;
++pr_info("LOOPBACK WRITE before copy_from_user: system now = %llu us\n", t_start_us);
++//pr_info("LOOPBACK WRITE before copy_from_user: system now = %llu us\n",
++//        t_start);
++		// 只拷贝图像数据部分
++		if (copy_from_user((void *)(dev->image + b->m.offset), (void *)buf,
++				   dev->buffer_size)) {
++			printk(KERN_ERR "v4l2-loopback write() failed copy_from_user() for image\n");
++			return -EFAULT;
++		}
++		u64 t_end = ktime_get_ns();
++		u64 t_end_us = t_end / 1000;
++pr_info("LOOPBACK WRITE after copy_from_user: system now = %llu us\n", t_end_us);
++//pr_info("LOOPBACK WRITE after copy_from_user: system now = %llu us\n",
++//        t_end);
++		b->bytesused = dev->buffer_size;
++
++	} else if (count <= dev->buffer_size) {
++		pr_info("v4l2loopback write contains no metadata\n");
++		// 兼容旧模式：无 metadata
++		size_t copy_size = count;
++		if (copy_size > dev->buffer_size)
++			copy_size = dev->buffer_size;
++
++		if (copy_from_user((void *)(dev->image + b->m.offset), (void *)buf,
++				   copy_size)) {
++			printk(KERN_ERR "v4l2-loopback write() failed copy_from_user()\n");
++			return -EFAULT;
++		}
++		b->bytesused = copy_size;
++
++		// 使用内核时间戳
++		v4l2l_get_timestamp(b);
++	} else {
++		pr_info("v4l2loopback write metadata invalid\n");
++		// 非法大小：既不是 image_size，也不是 image_size+16
++		printk(KERN_WARNING "v4l2-loopback: unexpected write size %zu (expected %zu or %zu)\n",
++		       count, dev->buffer_size, dev->buffer_size + META_SIZE);
++		return -EINVAL;
+ 	}
+-	b->bytesused = count;
+ 
+-	v4l2l_get_timestamp(b);
++	// 如果有 metadata，覆盖 timestamp
++	if (has_meta) {
++		b->timestamp.tv_sec = user_sec;
++		b->timestamp.tv_usec = user_usec;
++		uint64_t timestamp_us = user_sec * 1000000 + user_usec;
++
++		pr_info( "LOOPBACK WRITE: Applied side-data timestamp = %llu us (sec: %llu, usec: %llu)\n",
++		       timestamp_us, user_sec, user_usec);
++	}
++
++	
++	now = ktime_get(); // 纳秒级
++now_us = ktime_to_ns(now) / 1000;
++pr_info("LOOPBACK WRITE after generate timestamp that user finally get: system now = %llu us, buffer ts = %llu us, seq = %u\n",
++        now_us,
++        (u64)b->timestamp.tv_sec * 1000000 + b->timestamp.tv_usec,
++        b->sequence);
++        
+ 	b->sequence = dev->write_position;
+ 	set_queued(b->flags);
+ 	buffer_written(dev, &dev->buffers[index]);
+@@ -2492,6 +2571,7 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
+ 	return count;
+ }
+ 
++
+ /* init functions */
+ /* frees buffers, if allocated */
+ static void free_buffers(struct v4l2_loopback_device *dev)
