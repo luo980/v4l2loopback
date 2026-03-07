@@ -1865,15 +1865,18 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
 		dprintkrw("QBUF(OUTPUT, index=%u) -> " BUFFER_DEBUG_FMT_STR,
 			  index, BUFFER_DEBUG_FMT_ARGS(buf));
-		if (!(bufd->buffer.flags & V4L2_BUF_FLAG_TIMESTAMP_COPY) &&
-		    (buf->timestamp.tv_sec == 0 &&
-		     buf->timestamp.tv_usec == 0)) {
+		if (buf->timestamp.tv_sec == 0 &&
+		    buf->timestamp.tv_usec == 0) {
 			v4l2l_get_timestamp(&bufd->buffer);
 		} else {
+			/* Preserve caller-provided timestamp (e.g. from
+			 * real camera's v4l2_buffer.timestamp).  Keep
+			 * MONOTONIC flag so consumers see the original
+			 * CLOCK_MONOTONIC value for pipeline e2e
+			 * measurement. */
 			bufd->buffer.timestamp = buf->timestamp;
-			bufd->buffer.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
-			bufd->buffer.flags &=
-				~V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+			bufd->buffer.flags |= V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+			bufd->buffer.flags &= ~V4L2_BUF_FLAG_TIMESTAMP_COPY;
 		}
 		if (dev->pix_format_has_valid_sizeimage) {
 			if (buf->bytesused >= dev->pix_format.sizeimage) {
@@ -2472,12 +2475,8 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
 	struct v4l2_buffer *b;
-	ktime_t now;
-	u64 now_us;
 	int index, result;
-	const size_t META_SIZE = 16; // 8B sec + 8B usec
-	bool has_meta = false;
-	u64 user_sec = 0, user_usec = 0;
+	size_t copy_size;
 
 	dprintkrw("write() %zu bytes\n", count);
 	result = start_fileio(file, file->private_data,
@@ -2485,137 +2484,24 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 	if (result < 0)
 		return result;
 
-	//if (count > dev->buffer_size)
-		//count = dev->buffer_size;
 	index = v4l2l_mod64(dev->write_position, dev->used_buffer_count);
 	b = &dev->buffers[index].buffer;
-	
-	// 调试：打印接收到的数据大小和期望的大小
-	pr_info("LOOPBACK WRITE: received count=%zu, buffer_size=%u, expected with meta=%u\n",
-	       count, dev->buffer_size, dev->buffer_size + META_SIZE);
-	
-	// 判断是否包含 metadata
-	// 对于压缩格式（如 MJPEG），数据大小是变化的，所以只要 count >= META_SIZE，
-	// 就检查最后 16 字节是否是 metadata
-	if (count >= META_SIZE) {
-		pr_info("v4l2loopback write contains metadata (count=%zu >= META_SIZE=%zu)\n",
-		       count, META_SIZE);
-		has_meta = true;
-		char meta_buf[META_SIZE];
 
-		// 从用户空间读取最后 16 字节（metadata 在数据末尾）
-		if (copy_from_user(meta_buf, buf + count - META_SIZE, META_SIZE)) {
-			printk(KERN_ERR "v4l2-loopback: failed to read metadata\n");
-			return -EFAULT;
-		}
+	copy_size = count;
+	if (copy_size > dev->buffer_size)
+		copy_size = dev->buffer_size;
 
-		// 解析大端序的 sec 和 usec（使用手动字节序转换避免对齐问题）
-		user_sec = ((u64)meta_buf[0] << 56) | ((u64)meta_buf[1] << 48) |
-			   ((u64)meta_buf[2] << 40) | ((u64)meta_buf[3] << 32) |
-			   ((u64)meta_buf[4] << 24) | ((u64)meta_buf[5] << 16) |
-			   ((u64)meta_buf[6] << 8)  | ((u64)meta_buf[7]);
-		user_usec = ((u64)meta_buf[8] << 56) | ((u64)meta_buf[9] << 48) |
-			    ((u64)meta_buf[10] << 40) | ((u64)meta_buf[11] << 32) |
-			    ((u64)meta_buf[12] << 24) | ((u64)meta_buf[13] << 16) |
-			    ((u64)meta_buf[14] << 8)  | ((u64)meta_buf[15]);
-
-		// 调试：打印原始字节和解析结果
-		pr_info("LOOPBACK WRITE: Parsed metadata - raw bytes: "
-		       "%02x %02x %02x %02x %02x %02x %02x %02x | "
-		       "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-		       meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3],
-		       meta_buf[4], meta_buf[5], meta_buf[6], meta_buf[7],
-		       meta_buf[8], meta_buf[9], meta_buf[10], meta_buf[11],
-		       meta_buf[12], meta_buf[13], meta_buf[14], meta_buf[15]);
-		pr_info("LOOPBACK WRITE: Parsed - user_sec=%llu, user_usec=%llu\n",
-		       user_sec, user_usec);
-
-		uint64_t timestamp_us = user_sec * 1000000 + user_usec;
-		u64 now_ns = ktime_get_ns();
-		u64 now_us = now_ns / 1000;
-
-		// 记录解析 FFmpeg 传入的时间戳（使用 trace 日志，格式同 FFmpeg）
-		log_point("LOOPBACK parse timestamp",
-			  timestamp_us,
-			  now_us);
-
-		pr_info("LOOPBACK WRITE: Applied side-data timestamp = %llu us (sec: %llu, usec: %llu)\n",
-		       timestamp_us, user_sec, user_usec);
-		
-		
-		u64 t_start = ktime_get_ns();
-		u64 t_start_us = t_start/1000;
-pr_info("LOOPBACK WRITE before copy_from_user: system now = %llu us\n", t_start_us);
-//pr_info("LOOPBACK WRITE before copy_from_user: system now = %llu us\n",
-//        t_start);
-		// 只拷贝图像数据部分（不包含最后 16 字节的 metadata）
-		size_t image_size = count - META_SIZE;
-		if (image_size > dev->buffer_size) {
-			printk(KERN_WARNING "v4l2-loopback: image size %zu exceeds buffer_size %u, truncating\n",
-			       image_size, dev->buffer_size);
-			image_size = dev->buffer_size;
-		}
-		if (copy_from_user((void *)(dev->image + b->m.offset), (void *)buf,
-				   image_size)) {
-			printk(KERN_ERR "v4l2-loopback write() failed copy_from_user() for image\n");
-			return -EFAULT;
-		}
-		u64 t_end = ktime_get_ns();
-		u64 t_end_us = t_end / 1000;
-pr_info("LOOPBACK WRITE after copy_from_user: system now = %llu us\n", t_end_us);
-//pr_info("LOOPBACK WRITE after copy_from_user: system now = %llu us\n",
-//        t_end);
-		b->bytesused = image_size;
-
-	} else {
-		// count < META_SIZE，数据太小，无法包含 metadata
-		pr_info("v4l2loopback write contains no metadata (count=%zu < META_SIZE=%zu)\n",
-		       count, META_SIZE);
-		// 兼容旧模式：无 metadata
-		size_t copy_size = count;
-		if (copy_size > dev->buffer_size)
-			copy_size = dev->buffer_size;
-
-		if (copy_from_user((void *)(dev->image + b->m.offset), (void *)buf,
-				   copy_size)) {
-			printk(KERN_ERR "v4l2-loopback write() failed copy_from_user()\n");
-			return -EFAULT;
-		}
-		b->bytesused = copy_size;
-
-		// 使用内核时间戳
-		v4l2l_get_timestamp(b);
+	if (copy_from_user((void *)(dev->image + b->m.offset), (void *)buf,
+			   copy_size)) {
+		printk(KERN_ERR "v4l2-loopback write() failed copy_from_user()\n");
+		return -EFAULT;
 	}
+	b->bytesused = copy_size;
 
-	// 如果有 metadata，覆盖 timestamp
-	if (has_meta) {
-		b->timestamp.tv_sec = (long)user_sec;
-		b->timestamp.tv_usec = (long)user_usec;
-		// 设置时间戳标志位，表示这是从用户空间复制的时间戳
-		b->flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
-		b->flags &= ~V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-		
-		uint64_t timestamp_us = (u64)b->timestamp.tv_sec * 1000000 + b->timestamp.tv_usec;
-		u64 now_ns = ktime_get_ns();
-		u64 now_us = now_ns / 1000;
-		
-		// 记录设置 v4l2_buffer 时间戳（使用 trace 日志，格式同 FFmpeg）
-		log_point("LOOPBACK set buffer timestamp",
-			  timestamp_us,
-			  now_us);
-		
-		pr_info("LOOPBACK WRITE: Set buffer timestamp - tv_sec=%lld, tv_usec=%lld, total_us=%llu\n",
-		       (long long)b->timestamp.tv_sec, (long long)b->timestamp.tv_usec, timestamp_us);
-	}
+	/* write() path: always use kernel timestamp (CLOCK_MONOTONIC).
+	 * For timestamp passthrough, use the V4L2 OUTPUT QBUF API instead. */
+	v4l2l_get_timestamp(b);
 
-	
-	now = ktime_get(); // 纳秒级
-now_us = ktime_to_ns(now) / 1000;
-pr_info("LOOPBACK WRITE after generate timestamp that user finally get: system now = %llu us, buffer ts = %llu us, seq = %u\n",
-        now_us,
-        (u64)b->timestamp.tv_sec * 1000000 + b->timestamp.tv_usec,
-        b->sequence);
-        
 	b->sequence = dev->write_position;
 	set_queued(b->flags);
 	buffer_written(dev, &dev->buffers[index]);
